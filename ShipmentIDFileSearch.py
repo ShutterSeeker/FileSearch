@@ -4,13 +4,13 @@ import sys
 import os
 import configparser
 import pyodbc
-from datetime import datetime
+from datetime import datetime, timedelta
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QMessageBox, QDialog, QFormLayout,
-    QTableWidget, QTableWidgetItem, QStackedWidget, QHeaderView, QCheckBox
+    QTableWidget, QTableWidgetItem, QStackedWidget, QCheckBox, QDateEdit
 )
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QPalette, QColor, QIcon
+from PyQt5.QtCore import Qt, QDate
+from PyQt5.QtGui import QIcon
 
 SETTINGS_FILE = 'settings.ini'
 
@@ -40,6 +40,63 @@ def save_settings(settings):
     }
     with open(SETTINGS_FILE, 'w') as f:
         config.write(f)
+
+class DateRangeDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Manual Date Search')
+        self.setMinimumWidth(400)
+        
+        layout = QVBoxLayout()
+        
+        # Message label
+        msg_label = QLabel('Shipment not found in SCALE database.\nWould you like to manually select a date range to search?')
+        msg_label.setWordWrap(True)
+        msg_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(msg_label)
+        
+        # Date range form
+        form_layout = QFormLayout()
+        
+        # Start date
+        self.start_date_edit = QDateEdit()
+        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setDate(QDate.currentDate())
+        self.start_date_edit.setDisplayFormat('MM/dd/yyyy')
+        form_layout.addRow('Start Date:', self.start_date_edit)
+        
+        # End date
+        self.end_date_edit = QDateEdit()
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setDate(QDate.currentDate())
+        self.end_date_edit.setDisplayFormat('MM/dd/yyyy')
+        form_layout.addRow('End Date:', self.end_date_edit)
+        
+        layout.addLayout(form_layout)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        self.search_btn = QPushButton('Search')
+        self.search_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(self.search_btn)
+        
+        self.cancel_btn = QPushButton('Cancel')
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(self.cancel_btn)
+        
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+    
+    def get_date_range(self):
+        """Returns (start_date, end_date) as datetime objects"""
+        start_qdate = self.start_date_edit.date()
+        end_qdate = self.end_date_edit.date()
+        
+        start_date = datetime(start_qdate.year(), start_qdate.month(), start_qdate.day())
+        end_date = datetime(end_qdate.year(), end_qdate.month(), end_qdate.day())
+        
+        return start_date, end_date
 
 class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
@@ -251,6 +308,10 @@ class FileViewerDialog(QDialog):
             QTableWidget::item:selected { background-color: #444; }
             QHeaderView::section { background-color: #444; color: #F0F0F0; border: 1px solid #666; }
             QCheckBox { color: #F0F0F0; }
+            QDateEdit { background-color: #2b2b2b; color: #F0F0F0; border: 1px solid #444; }
+            QCalendarWidget { background-color: #2b2b2b; color: #F0F0F0; }
+            QCalendarWidget QTableView { background-color: #2b2b2b; color: #F0F0F0; }
+            QCalendarWidget QAbstractItemView:enabled { color: #F0F0F0; background-color: #2b2b2b; }
         """
         self.setStyleSheet(dark_stylesheet)
 
@@ -396,7 +457,14 @@ class FileViewerDialog(QDialog):
             return
         dt = self.get_datetime_from_sql(shipment_id)
         if not dt:
-            QMessageBox.warning(self, 'Error', 'Could not retrieve creation datetime from SQL.')
+            # Show date range dialog instead of error message
+            date_dialog = DateRangeDialog(self)
+            if self.settings.get('darkMode', True):
+                date_dialog.setStyleSheet(self.styleSheet())
+            
+            if date_dialog.exec_() == QDialog.Accepted:
+                start_date, end_date = date_dialog.get_date_range()
+                self.search_files_by_date_range(shipment_id, start_date, end_date)
             return
         self.search_files(shipment_id, dt)
 
@@ -485,6 +553,83 @@ class FileViewerDialog(QDialog):
         
         if not found:
             self.status_label.setText(f'Done searching through {count} files. Shipment not found.')
+            self.files_searched = count
+
+    def search_files_by_date_range(self, shipment_id, start_date, end_date):
+        """Search for shipment ID across multiple dates in a date range"""
+        search_dir = self.settings['searchDir']
+
+        if not os.path.isdir(search_dir):
+            QMessageBox.critical(self, 'Error', f'Configured search directory not found:\n{search_dir}')
+            return
+
+        # Validate date range
+        if start_date > end_date:
+            QMessageBox.warning(self, 'Error', 'Start date cannot be after end date.')
+            return
+
+        # Generate list of date patterns to search
+        patterns = []
+        current_date = start_date
+        while current_date <= end_date:
+            yy = current_date.strftime('%y')
+            mm = current_date.strftime('%m')
+            dd = current_date.strftime('%d')
+            patterns.append(f"shp-{mm}{dd}{yy}")
+            current_date += timedelta(days=1)
+
+        # Get all matching files
+        try:
+            all_files = os.listdir(search_dir)
+        except (OSError, PermissionError) as e:
+            QMessageBox.critical(self, 'Error', f'Error reading directory:\n{e}')
+            return
+
+        # Filter files that match any of our date patterns
+        files_to_search = []
+        for fname in all_files:
+            if fname.endswith('.sh.proc'):
+                for pattern in patterns:
+                    if fname.startswith(pattern):
+                        files_to_search.append(fname)
+                        break
+
+        if not files_to_search:
+            self.status_label.setText(f'No files found for date range {start_date.strftime("%m/%d/%Y")} to {end_date.strftime("%m/%d/%Y")}')
+            return
+
+        # Update status
+        self.status_label.setText(f'Searching {len(files_to_search)} files in date range...')
+
+        found = False
+        count = 0
+
+        for fname in files_to_search:
+            count += 1
+            fpath = os.path.join(search_dir, fname)
+
+            # Update progress every 10 files
+            if count % 10 == 0:
+                self.status_label.setText(f'Searching... checked {count} of {len(files_to_search)} files')
+
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    contents = f.read()
+                if shipment_id in contents:
+                    self.files_searched = count
+                    self.status_label.setText(f'Found shipment in file: {fname} (searched {count} of {len(files_to_search)} files)')
+                    self.load_file(fpath)
+                    found = True
+                    break
+            except (OSError, PermissionError):
+                # Skip files we can't read
+                continue
+            except Exception:
+                # Skip any other file reading errors
+                continue
+
+        if not found:
+            self.status_label.setText(f'Done searching through {count} files. Shipment not found in date range.')
             self.files_searched = count
 
 class MainWindow(QWidget):
