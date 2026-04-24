@@ -151,6 +151,48 @@ class FileViewerDialog(QDialog):
         self.map_order = []
         self.initUI()
 
+    def _get_sql_driver(self):
+        """Return the best available SQL Server ODBC driver installed on this machine."""
+        preferred_drivers = [
+            'ODBC Driver 18 for SQL Server',
+            'ODBC Driver 17 for SQL Server',
+            'ODBC Driver 13 for SQL Server',
+            'ODBC Driver 11 for SQL Server',
+            'SQL Server',
+        ]
+        installed = [d.strip() for d in pyodbc.drivers()]
+
+        for driver_name in preferred_drivers:
+            if driver_name in installed:
+                return driver_name
+
+        for driver_name in installed:
+            if 'SQL Server' in driver_name:
+                return driver_name
+
+        return None
+
+    def _create_sql_connection(self):
+        s = self.settings
+        driver_name = self._get_sql_driver()
+        if not driver_name:
+            installed = pyodbc.drivers()
+            installed_text = ', '.join(installed) if installed else 'none'
+            raise RuntimeError(
+                'No SQL Server ODBC driver is installed. '
+                'Install Microsoft ODBC Driver 17 or 18 for SQL Server. '
+                f'Installed ODBC drivers: {installed_text}'
+            )
+
+        conn_str = (
+            f"DRIVER={{{driver_name}}};"
+            f"SERVER={s['server']};"
+            f"DATABASE={s['database']};"
+            'Trusted_Connection=yes;'
+            'TrustServerCertificate=yes;'
+        )
+        return pyodbc.connect(conn_str)
+
     def get_mapping(self):
         s = self.settings
         if not s['server'] or not s['database']:
@@ -158,7 +200,7 @@ class FileViewerDialog(QDialog):
 
         # Use context manager for better resource management
         try:
-            with pyodbc.connect(f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={s['server']};DATABASE={s['database']};Trusted_Connection=yes;") as conn:
+            with self._create_sql_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("SELECT MAP_NAME, POSITION, FIELD_NAME FROM INTERFACE_DATA_MAP_DETAIL")
                     mapping = {}
@@ -332,11 +374,13 @@ class FileViewerDialog(QDialog):
         if hasattr(self, 'pages'):
             self.pages.clear()
 
-        # Accept the close event
-        event.accept()
+        # Let Qt process the close event normally.
+        super().closeEvent(event)
 
         # Ensure the application quits when the dialog is closed
-        QApplication.quit()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def create_page(self, map_name):
         widget = QWidget()
@@ -476,7 +520,7 @@ class FileViewerDialog(QDialog):
 
         # Use context manager for better resource management
         try:
-            with pyodbc.connect(f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={s['server']};DATABASE={s['database']};Trusted_Connection=yes;") as conn:
+            with self._create_sql_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
                         """
@@ -632,48 +676,18 @@ class FileViewerDialog(QDialog):
             self.status_label.setText(f'Done searching through {count} files. Shipment not found in date range.')
             self.files_searched = count
 
-class MainWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.settings = load_settings()
-        # Just open the file viewer dialog directly
-        self.open_file_viewer()
-
-    def open_file_viewer(self):
-        # Create dialog without parent to avoid cleanup issues
-        dialog = FileViewerDialog(self.settings)
-
-        # Connect dialog signals to ensure application quits properly
-        dialog.finished.connect(self.on_dialog_finished)
-        dialog.rejected.connect(self.on_dialog_finished)
-
-        result = dialog.exec_()
-        return result
-
-    def on_dialog_finished(self):
-        # Close the main window and quit the application when dialog closes
-        self.close()
-        QApplication.quit()
-
-    def closeEvent(self, event):
-        # Ensure the application quits when the main window is closed
-        QApplication.quit()
-        event.accept()
-
-    def closeEvent(self, event):
-        # Ensure proper cleanup
-        super().closeEvent(event)
-
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
 
     # Set application properties for better cleanup
     app.setApplicationName('Shipment File Search')
     app.setApplicationVersion('1.0')
     app.setOrganizationName('JASCO')
 
-    # Create main window which will handle the dialog
-    mw = MainWindow()
+    # Run the file viewer as the primary window in the main event loop.
+    dialog = FileViewerDialog(load_settings())
+    dialog.show()
 
     # Start the event loop
     exit_code = app.exec_()
